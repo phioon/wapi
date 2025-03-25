@@ -81,6 +81,8 @@ import { Logger } from '../../config/logger.config';
 import { INSTANCE_DIR, ROOT_DIR } from '../../config/path.config';
 import { join, normalize } from 'path';
 import axios, { AxiosError } from 'axios';
+import http from 'http';
+import https from 'https';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
 import { Boom } from '@hapi/boom';
@@ -273,6 +275,12 @@ export class WAStartupService {
   private async sendDataWebhook<T = any>(event: WebhookEventsType, data: T) {
     const eventDesc = WebhookEventsEnum[event];
 
+    const buildAgent = (url: string) => {
+      return url.startsWith('http://')
+        ? { httpAgent: new http.Agent() }
+        : { httpsAgent: new https.Agent({ rejectUnauthorized: true }) }; // You can toggle this if needed
+    };
+
     try {
       if (this.webhook?.enabled) {
         if (this.webhook?.events && this.webhook?.events[event]) {
@@ -283,7 +291,10 @@ export class WAStartupService {
               instance: this.instance,
               data,
             },
-            { headers: { 'Resource-Owner': this.instance.ownerJid } },
+            { 
+              headers: { 'Resource-Owner': this.instance.ownerJid },
+              ...agent 
+            },
           );
         }
         if (!this.webhook?.events) {
@@ -294,7 +305,9 @@ export class WAStartupService {
               instance: this.instance,
               data,
             },
-            { headers: { 'Resource-Owner': this.instance.ownerJid } },
+            { 
+              headers: { 'Resource-Owner': this.instance.ownerJid },
+              ...agent },
           );
         }
       }
