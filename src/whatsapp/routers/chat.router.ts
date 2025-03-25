@@ -34,7 +34,7 @@
  * └──────────────────────────────────────────────────────────────────────────────┘
  */
 
-import { Query, RequestHandler, Router } from 'express';
+import { RequestHandler, Router } from 'express';
 import {
   archiveChatSchema,
   contactValidateSchema,
