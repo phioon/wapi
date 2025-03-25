@@ -283,9 +283,9 @@ export class WAStartupService {
 
     try {
       if (this.webhook?.enabled) {
-        if (this.webhook?.events && this.webhook?.events[event]) {
-          const agent = buildAgent(this.webhook.url);
-          
+        const agent = buildAgent(this.webhook.url);
+        
+        if (this.webhook?.events && this.webhook?.events[event]) {          
           await axios.post(
             this.webhook.url,
             {
