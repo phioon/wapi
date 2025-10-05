@@ -54,6 +54,7 @@ import makeWASocket, {
   GroupMetadata,
   isJidGroup,
   isJidUser,
+  isLidUser,
   makeCacheableSignalKeyStore,
   MessageUpsertType,
   ParticipantAction,
@@ -106,14 +107,7 @@ import {
   SendReactionDto,
   SendTextDto,
 } from '../dto/sendMessage.dto';
-import {
-  isArray,
-  isBase64,
-  isInt,
-  isNotEmpty,
-  isNumberString,
-  isURL,
-} from 'class-validator';
+import { isArray, isBase64, isInt, isNotEmpty, isURL } from 'class-validator';
 import {
   ArchiveChatDto,
   DeleteMessage,
@@ -453,8 +447,7 @@ export class WAStartupService {
     }
 
     if (connection === 'close') {
-      const shouldReconnect =
-        (lastDisconnect.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+      const shouldReconnect = (lastDisconnect.error as Boom)?.output?.statusCode !== 401;
       if (shouldReconnect) {
         await this.connectToWhatsapp();
       } else {
@@ -533,7 +526,7 @@ export class WAStartupService {
   private async setSocket() {
     this.endSession = false;
 
-    this.authState = (await this.defineAuthState()) as AuthState;
+    this.authState = await this.defineAuthState();
 
     const version = JSON.parse(this.configService.get<string>('WA_VERSION')) as WAVersion;
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
@@ -572,7 +565,13 @@ export class WAStartupService {
 
   public async reloadConnection(): Promise<WASocket> {
     try {
-      this.client = await this.setSocket();
+      await new Promise((resolve) => {
+        this.client.ws?.once('close', resolve);
+        this.client.ws?.['socket']?.['terminate']?.();
+      });
+      this.client.ws['socket'] = null;
+      await this.client.ws.connect();
+
       return this.client;
     } catch (error) {
       this.logger.error(error);
@@ -665,19 +664,32 @@ export class WAStartupService {
               remoteJid: chat.remoteJid,
             },
           })
-          .then((result) =>
-            this.repository.chat
-              .update({
-                where: {
-                  id: result.id,
-                },
-                data: {
-                  content: chat.content,
-                  updatedAt: new Date(),
-                },
-              })
-              .catch((err) => this.logger.error(err)),
-          )
+          .then((result) => {
+            if (result?.id) {
+              this.repository.chat
+                .update({
+                  where: {
+                    id: result.id,
+                  },
+                  data: {
+                    content: chat.content,
+                    updatedAt: new Date(),
+                  },
+                })
+                .catch((err) => null);
+            } else {
+              this.repository.chat
+                .create({
+                  data: {
+                    remoteJid: chat.remoteJid,
+                    content: chat.content,
+                    updatedAt: new Date(),
+                    instanceId: this.instance.id,
+                  },
+                })
+                .catch((err) => this.logger.error(err));
+            }
+          })
           .catch((err) => this.logger.error(err));
       });
     },
@@ -822,13 +834,13 @@ export class WAStartupService {
 
           messagesRaw.push({
             keyId: m.key.id,
-            keyRemoteJid: m.key.remoteJid,
+            keyRemoteJid: m.key?.remoteJid || m.key?.['lid'],
             keyFromMe: m.key.fromMe,
             pushName: m?.pushName || m.key.remoteJid.split('@')[0],
             keyParticipant: m?.participant || m.key?.participant,
             messageType,
             content: m.message[messageType] as PrismType.Prisma.JsonValue,
-            messageTimestamp: m.messageTimestamp as number,
+            messageTimestamp: m.messageTimestamp,
             instanceId: this.instance.id,
             device: getDevice(m.key.id),
           } as PrismType.Message);
@@ -853,6 +865,7 @@ export class WAStartupService {
     }) => {
       for (const received of messages) {
         if (!received?.message) {
+          await this.client.waitForMessage(received.key.id);
           continue;
         }
 
@@ -872,13 +885,13 @@ export class WAStartupService {
 
         const messageRaw = {
           keyId: received.key.id,
-          keyRemoteJid: received.key.remoteJid,
+          keyRemoteJid: received.key?.remoteJid || received?.key?.['lid'],
           keyFromMe: received.key.fromMe,
           pushName: received.pushName,
           keyParticipant: received?.participant || received.key?.participant,
           messageType,
           content: received.message[messageType] as PrismType.Prisma.JsonValue,
-          messageTimestamp: received.messageTimestamp as number,
+          messageTimestamp: received.messageTimestamp,
           instanceId: this.instance.id,
           device: (() => {
             if (isValidUlid(received.key.id)) {
@@ -974,7 +987,7 @@ export class WAStartupService {
         5: 'PLAYED',
       };
       for await (const { key, update } of args) {
-        if (update.status === 4 && key?.remoteJid) {
+        if (update.status === proto.WebMessageInfo.Status.READ && key?.remoteJid) {
           key.remoteJid = key.remoteJid.replace(/:\d+(?=@)/, '');
         }
 
@@ -1180,7 +1193,11 @@ export class WAStartupService {
   }
 
   private createJid(number: string): string {
-    if (number.includes('@g.us') || number.includes('@s.whatsapp.net')) {
+    if (
+      number.includes('@g.us') ||
+      number.includes('@s.whatsapp.net') ||
+      number.includes('@lid')
+    ) {
       return number;
     }
 
@@ -1285,7 +1302,7 @@ export class WAStartupService {
         await this.client.sendPresenceUpdate('paused', recipient);
       }
 
-      const messageSent: PrismType.Message = await (async () => {
+      const messageSent: Partial<PrismType.Message> = await (async () => {
         let q: proto.IWebMessageInfo;
         if (quoted) {
           q = {
@@ -1333,13 +1350,10 @@ export class WAStartupService {
           }
         }
 
-        this.client.ev.emit('messages.upsert', { messages: [m], type: 'notify' });
-
         return {
-          id: undefined,
           keyId: m.key.id,
           keyFromMe: m.key.fromMe,
-          keyRemoteJid: m.key.remoteJid,
+          keyRemoteJid: m.key?.remoteJid || m.key?.['lid'],
           keyParticipant: m?.participant,
           pushName: m?.pushName,
           messageType: getContentType(m.message),
@@ -1348,7 +1362,7 @@ export class WAStartupService {
             if (Long.isLong(m.messageTimestamp)) {
               return m.messageTimestamp.toNumber();
             }
-            return m.messageTimestamp as number;
+            return m.messageTimestamp;
           })(),
           instanceId: this.instance.id,
           device: 'web',
@@ -1357,7 +1371,7 @@ export class WAStartupService {
       })();
       if (this.databaseOptions.DB_OPTIONS.NEW_MESSAGE) {
         const { id } = await this.repository.message.create({
-          data: messageSent,
+          data: messageSent as PrismType.Message,
         });
         messageSent.id = id;
       }
@@ -1365,7 +1379,12 @@ export class WAStartupService {
       messageSent['externalAttributes'] = options?.externalAttributes;
 
       this.ws.send(this.instance.name, 'send.message', messageSent);
+      this.ws.send(this.instance.name, 'messages.upsert', messageSent);
+
       this.sendDataWebhook('sendMessage', messageSent).catch((error) =>
+        this.logger.error(error),
+      );
+      this.sendDataWebhook('messagesUpsert', messageSent).catch((error) =>
         this.logger.error(error),
       );
 
@@ -1410,7 +1429,7 @@ export class WAStartupService {
 
       if (Buffer.isBuffer(video)) {
         input = new PassThrough();
-        (input as PassThrough).end(video);
+        input.end(video);
       }
 
       ffmpeg(input as any)
@@ -1451,12 +1470,11 @@ export class WAStartupService {
       const audioStream = new PassThrough();
       const normalizedPath = normalize(inputPath);
 
-      const inputFormat =
-        format.input === 'mpga' || 'bin'
-          ? 'mp3'
-          : format.input === 'oga'
-            ? 'ogg'
-            : format.input;
+      const inputFormat = ['mpga', 'bin'].includes(format?.input)
+        ? 'mp3'
+        : format.input === 'oga'
+          ? 'ogg'
+          : format.input;
       const audioCodec = format.to === 'ogg' ? 'libvorbis' : 'aac';
       const outputFormat = format.to === 'ogg' ? 'ogg' : 'adts';
 
@@ -1562,7 +1580,7 @@ export class WAStartupService {
           media = readFileSync(fileName);
         } else {
           media = await this.convertAudioToWH(fileName, {
-            input: ext as string,
+            input: ext,
             to: 'ogg',
           });
         }
@@ -1587,6 +1605,9 @@ export class WAStartupService {
 
       if (mediaMessage?.fileName) {
         mimetype = mime.lookup(mediaMessage.fileName) as string;
+        if (mimetype === 'application/mp4') {
+          mimetype = 'video/mp4';
+        }
       }
 
       prepareMedia[mediaType].caption = mediaMessage?.caption;
@@ -1778,7 +1799,7 @@ export class WAStartupService {
     })();
 
     const message: proto.IMessage = {
-      viewOnceMessage: {
+      viewOnceMessageV2: {
         message: {
           messageContextInfo: {
             deviceListMetadata: {},
@@ -1838,7 +1859,7 @@ export class WAStartupService {
     })();
 
     const message: proto.IMessage = {
-      viewOnceMessage: {
+      viewOnceMessageV2: {
         message: {
           messageContextInfo: {
             deviceListMetadata: {},
@@ -1873,10 +1894,6 @@ export class WAStartupService {
                   name: 'single_select',
                   buttonParamsJson: value.toSectionsString(),
                 };
-              }),
-              messageParamsJson: JSON.stringify({
-                from: 'api',
-                templateId: ulid(Date.now()),
               }),
             },
           },
@@ -1928,7 +1945,9 @@ export class WAStartupService {
                 responseType: 'arraybuffer',
               });
               return new Uint8Array(response.data);
-            } catch {}
+            } catch (error) {
+              //
+            }
           }
         })(),
       },
@@ -1970,15 +1989,20 @@ export class WAStartupService {
     const onWhatsapp: OnWhatsAppDto[] = [];
     for await (const number of data.numbers) {
       const jid = this.createJid(number);
+      if (isLidUser(jid)) {
+        onWhatsapp.push(new OnWhatsAppDto(jid, !!true, jid));
+      }
       if (isJidGroup(jid)) {
         const group = await this.findGroup({ groupJid: jid }, 'inner');
-        onWhatsapp.push(new OnWhatsAppDto(group.id, !!group?.id, group?.subject));
+        onWhatsapp.push(new OnWhatsAppDto(group.id, !!group?.id, '', group?.subject));
       } else if (jid.includes('@broadcast')) {
         onWhatsapp.push(new OnWhatsAppDto(jid, true));
       } else {
         try {
           const result = (await this.client.onWhatsApp(jid))[0];
-          onWhatsapp.push(new OnWhatsAppDto(result.jid, !!result.exists));
+          onWhatsapp.push(
+            new OnWhatsAppDto(result.jid, !!result.exists, result?.['lid'] as string),
+          );
         } catch (error) {
           onWhatsapp.push(new OnWhatsAppDto(number, false));
         }
@@ -2311,7 +2335,7 @@ export class WAStartupService {
       orderBy: {
         messageTimestamp: 'desc',
       },
-      skip: query.offset * (query?.page === 1 ? 0 : (query?.page as number) - 1),
+      skip: query.offset * (query?.page === 1 ? 0 : query?.page - 1),
       take: query.offset,
       select: {
         id: true,
