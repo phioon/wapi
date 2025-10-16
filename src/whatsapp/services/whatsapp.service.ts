@@ -53,7 +53,6 @@ import makeWASocket, {
   getDevice,
   GroupMetadata,
   isJidGroup,
-  isJidUser,
   isLidUser,
   makeCacheableSignalKeyStore,
   MessageUpsertType,
@@ -66,6 +65,7 @@ import makeWASocket, {
   WACallEvent,
   WAConnectionState,
   WAMediaUpload,
+  WAMessage,
   WAMessageUpdate,
   WASocket,
   WAVersion,
@@ -77,6 +77,7 @@ import {
   GlobalWebhook,
   QrCode,
   ProviderSession,
+  EnvProxy,
 } from '../../config/env.config';
 import { Logger } from '../../config/logger.config';
 import { INSTANCE_DIR, ROOT_DIR } from '../../config/path.config';
@@ -153,6 +154,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'fs';
+import { createProxyAgents } from '../../utils/proxy';
 
 type InstanceQrCode = {
   count: number;
@@ -535,6 +537,9 @@ export class WAStartupService {
     const { EXPIRATION_TIME } = this.configService.get<QrCode>('QRCODE');
     const CONNECTION_TIMEOUT = this.configService.get<number>('CONNECTION_TIMEOUT');
 
+    const proxy = this.configService.get<EnvProxy>('PROXY');
+    const agents = createProxyAgents(proxy?.WS, proxy?.FETCH);
+
     const socketConfig: UserFacingSocketConfig = {
       auth: {
         creds: this.authState.state.creds,
@@ -543,6 +548,8 @@ export class WAStartupService {
           P({ level: 'silent' }) as any,
         ),
       },
+      agent: agents?.wsAgent,
+      fetchAgent: agents?.fetchAgent,
       logger: P({ level: 'silent' }) as any,
       printQRInTerminal: false,
       browser,
@@ -822,8 +829,14 @@ export class WAStartupService {
             continue;
           }
 
-          if (Long.isLong(m?.messageTimestamp)) {
-            m.messageTimestamp = m.messageTimestamp?.toNumber();
+          let timestamp = m?.messageTimestamp;
+
+          if (timestamp && typeof timestamp === 'object' && typeof timestamp.toNumber === 'function') {
+            timestamp = timestamp.toNumber();
+          }else if (timestamp && typeof timestamp === 'object' && 'low' in timestamp && 'high' in timestamp) {
+            timestamp = Number(timestamp.low) || 0;
+          }else if (typeof timestamp !== 'number') {
+            timestamp = 0;
           }
 
           const messageType = getContentType(m.message);
@@ -834,13 +847,13 @@ export class WAStartupService {
 
           messagesRaw.push({
             keyId: m.key.id,
-            keyRemoteJid: m.key?.remoteJid || m.key?.['lid'],
+            keyRemoteJid: this.normalizeJid(m.key),
             keyFromMe: m.key.fromMe,
             pushName: m?.pushName || m.key.remoteJid.split('@')[0],
-            keyParticipant: m?.participant || m.key?.participant,
+            keyParticipant: m?.participant || this.normalizeParticipant(m.key),
             messageType,
             content: m.message[messageType] as PrismType.Prisma.JsonValue,
-            messageTimestamp: m.messageTimestamp,
+            messageTimestamp: timestamp,
             instanceId: this.instance.id,
             device: getDevice(m.key.id),
           } as PrismType.Message);
@@ -883,12 +896,23 @@ export class WAStartupService {
           } as any;
         }
 
+        if (received.message?.protocolMessage) {
+          const m = received.message.protocolMessage;
+          if (typeof m?.type === 'number') {
+            const typeName =
+              proto.Message.ProtocolMessage.Type[m.type as any] ?? 'UNKNOWN_TYPE';
+            m.type = typeName as any;
+            received.message.protocolMessage = m;
+          }
+        }
+
         const messageRaw = {
           keyId: received.key.id,
-          keyRemoteJid: received.key?.remoteJid || received?.key?.['lid'],
+          keyRemoteJid: this.normalizeJid(received.key),
           keyFromMe: received.key.fromMe,
           pushName: received.pushName,
-          keyParticipant: received?.participant || received.key?.participant,
+          keyParticipant:
+            received?.participant || this.normalizeParticipant(received.key),
           messageType,
           content: received.message[messageType] as PrismType.Prisma.JsonValue,
           messageTimestamp: received.messageTimestamp,
@@ -1192,6 +1216,14 @@ export class WAStartupService {
     }
   }
 
+  private normalizeJid(key: proto.IMessageKey) {
+    return key?.remoteJid || key?.['remoteJidAlt'] || key?.['lid'];
+  }
+
+  private normalizeParticipant(key: proto.IMessageKey) {
+    return key?.participant || key?.['participantAlt'];
+  }
+
   private createJid(number: string): string {
     if (
       number.includes('@g.us') ||
@@ -1303,7 +1335,7 @@ export class WAStartupService {
       }
 
       const messageSent: Partial<PrismType.Message> = await (async () => {
-        let q: proto.IWebMessageInfo;
+        let q: WAMessage;
         if (quoted) {
           q = {
             key: {
@@ -1339,7 +1371,7 @@ export class WAStartupService {
           m.key = {
             id: id,
             remoteJid: jid,
-            participant: isJidUser(jid) ? jid : undefined,
+            participant: isLidUser(jid) ? jid : undefined,
             fromMe: true,
           };
 
@@ -2019,7 +2051,7 @@ export class WAStartupService {
     try {
       const keys: proto.IMessageKey[] = [];
       data.readMessages.forEach((read) => {
-        if (isJidGroup(read.remoteJid) || isJidUser(read.remoteJid)) {
+        if (isJidGroup(read.remoteJid) || isLidUser(read.remoteJid)) {
           keys.push({
             remoteJid: read.remoteJid,
             fromMe: read.fromMe,
@@ -2399,10 +2431,7 @@ export class WAStartupService {
       throw new BadRequestException('Empty or invalid array');
     }
     try {
-      await this.client.assertSessions(
-        chats.map((c) => this.createJid(c)),
-        true,
-      );
+      await this.client.assertSessions(chats.map((c) => this.createJid(c)));
       return { message: 'Session asserted' };
     } catch (error) {
       throw new InternalServerErrorException('Error asserting session', error.toString());
